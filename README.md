@@ -21,7 +21,7 @@ It calculates:
 - paired bootstrap 95% confidence interval
 - two-sided bootstrap p value
 
-## Recommended settings for Jason's current analysis
+## Recommended settings for current analysis
 
 - Positive outcome value: `0`
 - Prediction direction: `Lower marker value predicts positive`
