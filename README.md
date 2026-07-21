@@ -29,18 +29,6 @@ It calculates:
 - Bootstrap iterations: `10000`
 - Random seed: `16`
 
-## GitHub Pages deployment
-
-1. Create a new GitHub repository.
-2. Upload `index.html`, `README.md`, and `.nojekyll` to the repository root.
-3. Go to repository **Settings** → **Pages**.
-4. Under **Build and deployment**, choose **Deploy from a branch**.
-5. Select branch: `main`; folder: `/root`.
-6. Save.
-
-The site will be published at:
-
-`https://<your-github-username>.github.io/<repository-name>/`
 
 ## Privacy note
 
