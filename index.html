@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Youden Index Paired Bootstrap Calculator</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; margin: 24px; color: #222; }
+  h1 { margin-bottom: 4px; }
+  .note { color: #555; line-height: 1.5; }
+  .box { border: 1px solid #ccc; border-radius: 8px; padding: 16px; margin: 14px 0; }
+  label { display: inline-block; margin: 8px 10px 8px 0; }
+  select, input { padding: 6px; margin-left: 4px; min-width: 160px; }
+  button { padding: 8px 14px; margin: 6px 6px 6px 0; cursor: pointer; }
+  button:disabled { cursor: not-allowed; opacity: 0.6; }
+  table { border-collapse: collapse; margin-top: 12px; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 7px; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  th { background: #f3f3f3; }
+  #status { font-weight: bold; margin-top: 8px; }
+  #methodText { white-space: pre-wrap; background: #f8f8f8; padding: 12px; border: 1px solid #ddd; }
+  .warn { color: #8a4b00; }
+  .ok { color: #006b2e; }
+  .bad { color: #9c1c1c; }
+  .small { font-size: 0.92em; }
+</style>
+</head>
+<body>
+<h1>Youden Index Paired Bootstrap Calculator</h1>
+<p class="note">
+This is a single-file browser-based tool. Open the HTML file, upload an Excel or CSV file, and compare the Youden index between two paired biomarkers.
+<br>
+Excel reading uses the browser-side SheetJS library. If the computer is offline, save the Excel file as CSV and upload the CSV file instead.
+</p>
+
+<div class="box">
+  <h3>1. Upload Data</h3>
+  <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+  <div id="fileInfo" class="note"></div>
+</div>
+
+<div class="box">
+  <h3>2. Analysis Settings</h3>
+  <label>Outcome column:
+    <select id="outcomeCol"></select>
+  </label>
+  <label>Marker 1:
+    <select id="marker1Col"></select>
+  </label>
+  <label>Marker 2:
+    <select id="marker2Col"></select>
+  </label>
+  <br>
+  <label>Positive outcome value:
+    <input id="positiveValue" value="0">
+  </label>
+  <label>Prediction direction:
+    <select id="direction">
+      <option value="lower">Lower marker value predicts positive</option>
+      <option value="higher">Higher marker value predicts positive</option>
+    </select>
+  </label>
+  <br>
+  <label>Cutoff method:
+    <select id="cutoffMethod">
+      <option value="reopt">Re-optimize cutoff in each bootstrap sample</option>
+      <option value="fixed">Use fixed cutoffs</option>
+    </select>
+  </label>
+  <label>Fixed cutoff marker 1:
+    <input id="fixedCutoff1" placeholder="optional" disabled>
+  </label>
+  <label>Fixed cutoff marker 2:
+    <input id="fixedCutoff2" placeholder="optional" disabled>
+  </label>
+  <br>
+  <label>Bootstrap iterations:
+    <input id="iterations" type="number" value="10000" min="100" step="100">
+  </label>
+  <label>Random seed:
+    <input id="seed" type="number" value="2026" min="1">
+  </label>
+  <br>
+  <button id="runBtn" disabled>Run Analysis</button>
+  <button id="downloadBtn" disabled>Download Results CSV</button>
+  <div id="status">Please upload a file first.</div>
+</div>
+
+<div class="box">
+  <h3>3. Original Data Results</h3>
+  <div id="originalResults"></div>
+</div>
+
+<div class="box">
+  <h3>4. Paired Bootstrap Results</h3>
+  <div id="bootstrapResults"></div>
+</div>
+
+<div class="box">
+  <h3>5. Methods Text</h3>
+  <div id="methodText">After running the analysis, a Methods paragraph will be generated here.</div>
+</div>
+
+<script>
+let rawData = [];
+let columns = [];
+let lastResultCSV = "";
+
+document.getElementById("cutoffMethod").addEventListener("change", function() {
+  const fixed = this.value === "fixed";
+  document.getElementById("fixedCutoff1").disabled = !fixed;
+  document.getElementById("fixedCutoff2").disabled = !fixed;
+});
+
+function setStatus(text, cls="") {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.className = cls;
+}
+
+function mulberry32(seed) {
+  return function() {
+    let t = seed += 0x6D2B79F5;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  }
+}
+
+function parseCSV(text) {
+  const rows = [];
+  let row = [], cell = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i], next = text[i+1];
+    if (c === '"' && inQuotes && next === '"') { cell += '"'; i++; }
+    else if (c === '"') { inQuotes = !inQuotes; }
+    else if (c === ',' && !inQuotes) { row.push(cell); cell = ""; }
+    else if ((c === '\n' || c === '\r') && !inQuotes) {
+      if (c === '\r' && next === '\n') i++;
+      row.push(cell);
+      if (row.some(x => x !== "")) rows.push(row);
+      row = []; cell = "";
+    } else { cell += c; }
+  }
+  row.push(cell);
+  if (row.some(x => x !== "")) rows.push(row);
+  if (rows.length < 2) throw new Error("CSV file has fewer than 2 rows.");
+  const headers = rows[0].map(h => String(h).trim());
+  return rows.slice(1).map(r => {
+    const obj = {};
+    headers.forEach((h, idx) => obj[h] = r[idx] ?? "");
+    return obj;
+  });
+}
+
+document.getElementById("fileInput").addEventListener("change", async function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  try {
+    const name = file.name.toLowerCase();
+    if (name.endsWith(".csv")) {
+      const text = await file.text();
+      rawData = parseCSV(text);
+    } else {
+      if (typeof XLSX === "undefined") {
+        throw new Error("Excel parser not loaded. Please connect to the internet or save the file as CSV.");
+      }
+      const arrayBuffer = await file.arrayBuffer();
+      const workbook = XLSX.read(arrayBuffer, {type: "array"});
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      rawData = XLSX.utils.sheet_to_json(sheet, {defval: ""});
+    }
+
+    if (!rawData.length) throw new Error("No data found.");
+    columns = Object.keys(rawData[0]);
+    populateSelects(columns);
+    document.getElementById("fileInfo").textContent = `Loaded: ${file.name}; rows = ${rawData.length}; columns = ${columns.join(", ")}`;
+    document.getElementById("runBtn").disabled = false;
+    setStatus("File loaded. Ready to run analysis.", "ok");
+  } catch (err) {
+    alert("File loading error: " + err.message);
+    setStatus("File loading failed.", "bad");
+  }
+});
+
+function populateSelects(cols) {
+  const ids = ["outcomeCol", "marker1Col", "marker2Col"];
+  ids.forEach(id => {
+    const sel = document.getElementById(id);
+    sel.innerHTML = "";
+    cols.forEach(c => {
+      const opt = document.createElement("option");
+      opt.value = c; opt.textContent = c;
+      sel.appendChild(opt);
+    });
+  });
+  if (cols.includes("outcome")) document.getElementById("outcomeCol").value = "outcome";
+  if (cols.includes("TEX_PDL1_FOLD")) document.getElementById("marker1Col").value = "TEX_PDL1_FOLD";
+  if (cols.includes("Total_PDL1_fold")) document.getElementById("marker2Col").value = "Total_PDL1_fold";
+}
+
+function toNumber(x) {
+  const v = Number(x);
+  if (!Number.isFinite(v)) throw new Error("Non-numeric value found in marker/outcome column.");
+  return v;
+}
+
+function bestYouden(y, marker, positiveValue, lowerPredictsPositive) {
+  const unique = Array.from(new Set(marker)).sort((a,b) => a-b);
+  if (unique.length < 2) throw new Error("Marker has fewer than 2 unique values.");
+  const cutoffs = [];
+  for (let i = 0; i < unique.length - 1; i++) {
+    if (unique[i] !== unique[i+1]) cutoffs.push((unique[i] + unique[i+1]) / 2);
+  }
+
+  let best = {youden: -Infinity, cutoff: NaN, sensitivity: NaN, specificity: NaN, accuracy: NaN, TP: 0, FN: 0, TN: 0, FP: 0};
+
+  for (const cutoff of cutoffs) {
+    let TP=0, FN=0, TN=0, FP=0;
+    for (let i = 0; i < y.length; i++) {
+      const truePos = y[i] === positiveValue;
+      const predPos = lowerPredictsPositive ? marker[i] < cutoff : marker[i] >= cutoff;
+      if (predPos && truePos) TP++;
+      else if (!predPos && truePos) FN++;
+      else if (!predPos && !truePos) TN++;
+      else if (predPos && !truePos) FP++;
+    }
+    const sens = TP / (TP + FN);
+    const spec = TN / (TN + FP);
+    const acc = (TP + TN) / y.length;
+    const J = sens + spec - 1;
+    if (J > best.youden) best = {youden: J, cutoff, sensitivity: sens, specificity: spec, accuracy: acc, TP, FN, TN, FP};
+  }
+  return best;
+}
+
+function metricsAtCutoff(y, marker, positiveValue, cutoff, lowerPredictsPositive) {
+  let TP=0, FN=0, TN=0, FP=0;
+  for (let i = 0; i < y.length; i++) {
+    const truePos = y[i] === positiveValue;
+    const predPos = lowerPredictsPositive ? marker[i] < cutoff : marker[i] >= cutoff;
+    if (predPos && truePos) TP++;
+    else if (!predPos && truePos) FN++;
+    else if (!predPos && !truePos) TN++;
+    else if (predPos && !truePos) FP++;
+  }
+  const sens = TP / (TP + FN);
+  const spec = TN / (TN + FP);
+  const acc = (TP + TN) / y.length;
+  return {youden: sens + spec - 1, cutoff, sensitivity: sens, specificity: spec, accuracy: acc, TP, FN, TN, FP};
+}
+
+function percentile(arr, p) {
+  const a = arr.slice().sort((x,y) => x-y);
+  const idx = (a.length - 1) * p;
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
+  if (lo === hi) return a[lo];
+  return a[lo] + (a[hi] - a[lo]) * (idx - lo);
+}
+
+function fmt(x) {
+  return Number.isFinite(x) ? x.toFixed(4) : "";
+}
+
+function pct(x) {
+  return Number.isFinite(x) ? (100*x).toFixed(1) + "%" : "";
+}
+
+function tableHTML(rows) {
+  const headers = Object.keys(rows[0]);
+  let html = "<table><thead><tr>" + headers.map(h => `<th>${h}</th>`).join("") + "</tr></thead><tbody>";
+  for (const row of rows) {
+    html += "<tr>" + headers.map(h => `<td>${row[h]}</td>`).join("") + "</tr>";
+  }
+  html += "</tbody></table>";
+  return html;
+}
+
+function rowsToCSV(rows) {
+  if (!rows.length) return "";
+  const headers = Object.keys(rows[0]);
+  const esc = v => {
+    const s = String(v ?? "");
+    return /[",\n]/.test(s) ? '"' + s.replaceAll('"','""') + '"' : s;
+  };
+  return headers.map(esc).join(",") + "\n" + rows.map(r => headers.map(h => esc(r[h])).join(",")).join("\n");
+}
+
+document.getElementById("runBtn").addEventListener("click", async function() {
+  try {
+    this.disabled = true;
+    document.getElementById("downloadBtn").disabled = true;
+    setStatus("Running analysis. Please wait...");
+
+    const outcomeCol = document.getElementById("outcomeCol").value;
+    const marker1Col = document.getElementById("marker1Col").value;
+    const marker2Col = document.getElementById("marker2Col").value;
+    const positiveValue = Number(document.getElementById("positiveValue").value);
+    const lowerPredictsPositive = document.getElementById("direction").value === "lower";
+    const cutoffMode = document.getElementById("cutoffMethod").value;
+    const B = Number(document.getElementById("iterations").value);
+    const seed = Number(document.getElementById("seed").value);
+
+    const clean = rawData.map(r => ({
+      y: toNumber(r[outcomeCol]),
+      m1: toNumber(r[marker1Col]),
+      m2: toNumber(r[marker2Col])
+    })).filter(r => Number.isFinite(r.y) && Number.isFinite(r.m1) && Number.isFinite(r.m2));
+
+    const y0 = clean.map(r => r.y);
+    const m1_0 = clean.map(r => r.m1);
+    const m2_0 = clean.map(r => r.m2);
+    const n = y0.length;
+
+    if (!y0.some(v => v === positiveValue) || !y0.some(v => v !== positiveValue)) {
+      throw new Error("Outcome must contain both positive and negative classes.");
+    }
+
+    const orig1 = bestYouden(y0, m1_0, positiveValue, lowerPredictsPositive);
+    const orig2 = bestYouden(y0, m2_0, positiveValue, lowerPredictsPositive);
+    const observedDiff = orig1.youden - orig2.youden;
+
+    let fixed1 = orig1.cutoff, fixed2 = orig2.cutoff;
+    if (cutoffMode === "fixed") {
+      const f1 = document.getElementById("fixedCutoff1").value.trim();
+      const f2 = document.getElementById("fixedCutoff2").value.trim();
+      fixed1 = f1 === "" ? orig1.cutoff : Number(f1);
+      fixed2 = f2 === "" ? orig2.cutoff : Number(f2);
+      if (!Number.isFinite(fixed1) || !Number.isFinite(fixed2)) throw new Error("Invalid fixed cutoff.");
+    }
+
+    const rng = mulberry32(seed);
+    const diffs = [];
+    const cutoff1Values = [];
+    const cutoff2Values = [];
+
+    for (let b = 0; b < B; b++) {
+      const y = [], m1 = [], m2 = [];
+      for (let i = 0; i < n; i++) {
+        const idx = Math.floor(rng() * n);
+        y.push(y0[idx]); m1.push(m1_0[idx]); m2.push(m2_0[idx]);
+      }
+      if (!y.some(v => v === positiveValue) || !y.some(v => v !== positiveValue)) continue;
+
+      let r1, r2;
+      if (cutoffMode === "reopt") {
+        r1 = bestYouden(y, m1, positiveValue, lowerPredictsPositive);
+        r2 = bestYouden(y, m2, positiveValue, lowerPredictsPositive);
+      } else {
+        r1 = metricsAtCutoff(y, m1, positiveValue, fixed1, lowerPredictsPositive);
+        r2 = metricsAtCutoff(y, m2, positiveValue, fixed2, lowerPredictsPositive);
+      }
+      diffs.push(r1.youden - r2.youden);
+      cutoff1Values.push(r1.cutoff);
+      cutoff2Values.push(r2.cutoff);
+
+      if (b % 200 === 0) {
+        setStatus(`Running analysis... ${b}/${B}`);
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    }
+
+    const meanDiff = diffs.reduce((a,b) => a+b, 0) / diffs.length;
+    const medianDiff = percentile(diffs, 0.5);
+    const ciLower = percentile(diffs, 0.025);
+    const ciUpper = percentile(diffs, 0.975);
+    const le0 = diffs.filter(d => d <= 0).length / diffs.length;
+    const ge0 = diffs.filter(d => d >= 0).length / diffs.length;
+    const pValue = Math.min(1, 2 * Math.min(le0, ge0));
+
+    const originalRows = [
+      {"Marker": marker1Col, "Cutoff": fmt(orig1.cutoff), "Sensitivity": pct(orig1.sensitivity), "Specificity": pct(orig1.specificity), "Accuracy": pct(orig1.accuracy), "Youden index": fmt(orig1.youden), "TP": orig1.TP, "FN": orig1.FN, "TN": orig1.TN, "FP": orig1.FP},
+      {"Marker": marker2Col, "Cutoff": fmt(orig2.cutoff), "Sensitivity": pct(orig2.sensitivity), "Specificity": pct(orig2.specificity), "Accuracy": pct(orig2.accuracy), "Youden index": fmt(orig2.youden), "TP": orig2.TP, "FN": orig2.FN, "TN": orig2.TN, "FP": orig2.FP}
+    ];
+
+    const bootRows = [
+      {"Metric": "Observed Youden difference", "Value": fmt(observedDiff)},
+      {"Metric": "Bootstrap iterations used", "Value": diffs.length},
+      {"Metric": "Mean Youden difference", "Value": fmt(meanDiff)},
+      {"Metric": "Median Youden difference", "Value": fmt(medianDiff)},
+      {"Metric": "95% CI lower", "Value": fmt(ciLower)},
+      {"Metric": "95% CI upper", "Value": fmt(ciUpper)},
+      {"Metric": "Two-sided bootstrap p value", "Value": fmt(pValue)}
+    ];
+
+    document.getElementById("originalResults").innerHTML = tableHTML(originalRows);
+    document.getElementById("bootstrapResults").innerHTML =
+      tableHTML(bootRows) +
+      `<p class="${ciLower <= 0 && ciUpper >= 0 ? 'warn' : 'ok'}">Interpretation: ${ciLower <= 0 && ciUpper >= 0 ? "The 95% CI includes 0; the Youden index difference is not statistically significant." : "The 95% CI does not include 0; the Youden index difference is statistically significant."}</p>`;
+
+    const method = `Differences in Youden index between ${marker1Col} and ${marker2Col} were assessed using patient-level paired bootstrap resampling. In each bootstrap iteration, patients were resampled with replacement while preserving the paired measurements of both markers. ${cutoffMode === "reopt" ? "For each resampled dataset, the optimal cutoff for each marker was re-determined by maximizing the Youden index." : "The predefined cutoffs were used in each bootstrap sample."} The Youden index was calculated as sensitivity + specificity − 1, and the difference in Youden index was defined as the Youden index of ${marker1Col} minus that of ${marker2Col}. This procedure was repeated ${B.toLocaleString()} times to generate the bootstrap distribution of the Youden index difference. The 95% confidence interval was estimated from the 2.5th and 97.5th percentiles of the bootstrap distribution, and a two-sided bootstrap p value was calculated as twice the smaller proportion of bootstrap differences above or below zero.`;
+    document.getElementById("methodText").textContent = method;
+
+    const allRows = [
+      {"Section": "Original", ...originalRows[0]},
+      {"Section": "Original", ...originalRows[1]},
+      ...bootRows.map(r => ({"Section": "Bootstrap summary", "Marker": r.Metric, "Cutoff": r.Value, "Sensitivity": "", "Specificity": "", "Accuracy": "", "Youden index": "", "TP": "", "FN": "", "TN": "", "FP": ""}))
+    ];
+    lastResultCSV = rowsToCSV(allRows);
+    document.getElementById("downloadBtn").disabled = false;
+
+    setStatus("Analysis completed.", "ok");
+  } catch (err) {
+    alert("Analysis error: " + err.message);
+    setStatus("Analysis failed.", "bad");
+  } finally {
+    document.getElementById("runBtn").disabled = false;
+  }
+});
+
+document.getElementById("downloadBtn").addEventListener("click", function() {
+  const blob = new Blob([lastResultCSV], {type: "text/csv;charset=utf-8"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "youden_bootstrap_results.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
