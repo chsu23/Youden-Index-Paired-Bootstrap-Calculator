@@ -27,7 +27,7 @@ It calculates:
 - Prediction direction: `Lower marker value predicts positive`
 - Cutoff method: `Re-optimize cutoff in each bootstrap sample`
 - Bootstrap iterations: `10000`
-- Random seed: `2026`
+- Random seed: `16`
 
 ## GitHub Pages deployment
 
